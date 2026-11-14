@@ -5243,6 +5243,23 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     dep = dep || (t->src[si] && ggml_cuda_strip_views(t->src[si]) == ds[p]);
                 }
             }
+            // nor share memory with one: the allocator plans for one node after the other, so a later member's output
+            // may sit where an earlier member's input was (freed after that member), and the reverse; in one launch
+            // that is a race (seen as run-to-run differences in VoxCPM2's decode)
+            auto ovl = [](const ggml_tensor * x, const ggml_tensor * y) {
+                if (!x || !y || !x->data || !y->data) {
+                    return false;
+                }
+                const char * a0 = (const char *) x->data, * a1 = a0 + ggml_nbytes(x);
+                const char * b0 = (const char *) y->data, * b1 = b0 + ggml_nbytes(y);
+                return a0 < b1 && b0 < a1;
+            };
+            for (int p = 0; p < np && !dep; ++p) {
+                dep = ovl(t, ds[p]);
+                for (int si = 0; si < GGML_MAX_SRC && !dep; ++si) {
+                    dep = ovl(t, ds[p]->src[si]) || ovl(ds[p], t->src[si]);
+                }
+            }
             if (dep) {
                 break;
             }
