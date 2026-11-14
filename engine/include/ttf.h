@@ -41,7 +41,7 @@ struct Model {
     ~Model();
     // device: "cpu" or "cuda" (CUDA0; built with TTF_CUDA). Weights live in that device's buffer.
     // vae: a separate weights file (a speech model's VAE, e.g. MODEL-vae-q8_0.ttf); "" = next to the model when the
-    // model's own file lacks those tensors (MODEL-vae.ttf, then -vae-f32 / -bf16 / -q8_0 / -q4_0)
+    // model's own file lacks those tensors (MODEL-vae.ttf, then -vae-f32 / -bf16 / -q8_0 / -q4_k / -q4_0)
     static std::unique_ptr<Model> load(const std::string & path, std::string * err, const std::string & device = "cpu",
                                        const std::string & vae = "");
 

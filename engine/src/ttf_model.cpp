@@ -244,10 +244,11 @@ std::unique_ptr<Model> Model::load(const std::string & path, std::string * err, 
         std::string vp = vae;
         if (vp.empty() && m->ir.contains("graphs") && !missing_graphs().empty()) {
             const std::string stem = path.size() > 4 && path.compare(path.size() - 4, 4, ".ttf") == 0 ? path.substr(0, path.size() - 4) : path;
-            for (const char * sfx : { "-vae.ttf", "-vae-f32.ttf", "-vae-bf16.ttf", "-vae-q8_0.ttf", "-vae-q4_0.ttf" }) {
+            for (const char * sfx : { "-vae.ttf", "-vae-f32.ttf", "-vae-bf16.ttf", "-vae-q8_0.ttf", "-vae-q4_k.ttf", "-vae-q4_0.ttf" }) {
                 if (FILE * f = std::fopen((stem + sfx).c_str(), "rb")) {
                     std::fclose(f);
                     vp = stem + sfx;
+                    std::fprintf(stderr, "VAE: %s (found next to the model; --vae FILE picks another)\n", vp.c_str());
                     break;
                 }
             }
