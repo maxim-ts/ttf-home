@@ -273,6 +273,11 @@ std::unique_ptr<Model> Model::load(const std::string & path, std::string * err, 
             m->ir["graphs"].erase(gname);
             m->dropped_graphs.push_back(gname);
         }
+        if (std::find(m->dropped_graphs.begin(), m->dropped_graphs.end(), "vae_decode") != m->dropped_graphs.end()) {
+            throw std::runtime_error(path + " has no audio VAE: put its VAE file next to it (" +
+                                     (path.size() > 4 && path.compare(path.size() - 4, 4, ".ttf") == 0 ? path.substr(0, path.size() - 4) : path) +
+                                     "-vae-q8_0.ttf, -bf16, -f32, ...) or pass --vae FILE");
+        }
         // runtime trit layout: Q2P on the CPU (default), TQ1_P with TTF_TRITS=tq1p
         // TQ1_P on CUDA: memory-bound there, 1.6 vs 2 bits per trit
         const char * lt = std::getenv("TTF_TRITS");
