@@ -124,6 +124,12 @@ Model::~Model() {
     if (gguf) {
         gguf_free(gguf);
     }
+    if (vmeta) {
+        ggml_free(vmeta);
+    }
+    if (vgguf) {
+        gguf_free(vgguf);
+    }
     for (auto * b : bufs) {
         ggml_backend_buffer_free(b);
     }
@@ -141,7 +147,8 @@ ggml_tensor * Model::get(const std::string & name) const {
     return it == tensors.end() ? nullptr : it->second;
 }
 
-std::unique_ptr<Model> Model::load(const std::string & path, std::string * err, const std::string & device) {
+std::unique_ptr<Model> Model::load(const std::string & path, std::string * err, const std::string & device,
+                                   const std::string & vae) {
     auto m = std::make_unique<Model>();
     try {
         m->device = device;
@@ -216,6 +223,55 @@ std::unique_ptr<Model> Model::load(const std::string & path, std::string * err, 
         for (ggml_tensor * t = ggml_get_first_tensor(m->meta); t; t = ggml_get_next_tensor(m->meta, t)) {
             m->tensors[ggml_get_name(t)] = t;
         }
+        // a graph whose node weights are in no file: p has no tensor "p.*"
+        auto has_prefix = [&](const std::string & p) {
+            auto it = m->tensors.lower_bound(p + ".");
+            return it != m->tensors.end() && it->first.compare(0, p.size() + 1, p + ".") == 0;
+        };
+        auto missing_graphs = [&]() {
+            std::vector<std::string> out;
+            for (const auto & [gname, g] : m->ir.at("graphs").items()) {
+                for (const auto & n : g.at("nodes")) {
+                    if (n.contains("p") && n.at("p").is_string() && !has_prefix(n.at("p").get<std::string>())) {
+                        out.push_back(gname);
+                        break;
+                    }
+                }
+            }
+            return out;
+        };
+        // the separate weights file (VAE): given, or next to the model when the model's graphs need it
+        std::string vp = vae;
+        if (vp.empty() && m->ir.contains("graphs") && !missing_graphs().empty()) {
+            const std::string stem = path.size() > 4 && path.compare(path.size() - 4, 4, ".ttf") == 0 ? path.substr(0, path.size() - 4) : path;
+            for (const char * sfx : { "-vae.ttf", "-vae-f32.ttf", "-vae-bf16.ttf", "-vae-q8_0.ttf", "-vae-q4_0.ttf" }) {
+                if (FILE * f = std::fopen((stem + sfx).c_str(), "rb")) {
+                    std::fclose(f);
+                    vp = stem + sfx;
+                    break;
+                }
+            }
+        }
+        if (!vp.empty()) {
+            gguf_init_params vg = { /*no_alloc =*/false, /*ctx =*/&m->vmeta };
+            m->vgguf             = gguf_init_from_file(vp.c_str(), vg);
+            if (!m->vgguf) {
+                throw std::runtime_error("cannot read " + vp);
+            }
+            if (gguf_str(m->vgguf, "general.architecture", "") != "ttf" || gguf_str(m->vgguf, "ttf.weights_for", "") != m->family) {
+                throw std::runtime_error(vp + ": not a weights file for a " + m->family + " .ttf (ttf.weights_for)");
+            }
+            for (ggml_tensor * t = ggml_get_first_tensor(m->vmeta); t; t = ggml_get_next_tensor(m->vmeta, t)) {
+                if (!m->tensors.emplace(ggml_get_name(t), t).second) {
+                    throw std::runtime_error(vp + ": tensor " + ggml_get_name(t) + " is in the model file too");
+                }
+            }
+            m->vae_path = vp;
+        }
+        for (const std::string & gname : missing_graphs()) {  // used only on request: dropped (an error if called)
+            m->ir["graphs"].erase(gname);
+            m->dropped_graphs.push_back(gname);
+        }
         // runtime trit layout: Q2P on the CPU (default), TQ1_P with TTF_TRITS=tq1p
         // TQ1_P on CUDA: memory-bound there, 1.6 vs 2 bits per trit
         const char * lt = std::getenv("TTF_TRITS");
@@ -255,11 +311,16 @@ std::unique_ptr<Model> Model::load(const std::string & path, std::string * err, 
                         pend.push_back({ p, K, wp });
                     }
                 } else if (op == "conv_transpose1d_causal") {  // weight as [Cin, k Cout] for one mul_mat + overlap-add
-                    fder.emplace_back(n.at("p").get<std::string>() + ".weight", ".weight.ct");
+                    if (!m->get(n.at("p").get<std::string>() + ".weight.ct")) {  // (a weights file stores it so, maybe quantized)
+                        fder.emplace_back(n.at("p").get<std::string>() + ".weight", ".weight.ct");
+                    }
                 } else if (op == "matmul" || op == "conv1d_causal" ||
                            (op == "rms_norm" && n.contains("p") && n.at("attr").value("offset", false))) {
                     const std::string p    = n.at("p");
                     const std::string kind = op == "matmul" ? ".weight.F32" : op == "rms_norm" ? ".weight.off1" : ".weight.conv";
+                    if (op == "conv1d_causal" && m->get(p + ".weight.q")) {  // dense conv as [k Cin, Cout], maybe quantized
+                        continue;
+                    }
                     if (!m->get(p + ".weight")) {
                         throw std::runtime_error("missing " + p + ".weight");
                     }

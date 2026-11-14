@@ -674,9 +674,19 @@ struct Builder {
         xt                   = ggml_reshape_2d(ctx, xt, xt->ne[0], ggml_nelements(xt) / xt->ne[0]);  // [T, C]
         const int64_t C = xt->ne[1];
         const int     st = a.value("stride", 1), dl = a.value("dilation", 1), gr = a.value("groups", 1);
-        ggml_tensor * w  = weight(p + ".weight");  // ggml [k, Cin / g, Cout]
         ggml_tensor * full = with_ctx(a, xt, a.at("ctx").get<int>());
         ggml_tensor * y;
+        if (ggml_tensor * wq = m.get(p + ".weight.q")) {
+            // a weights file's dense conv: [k Cin, Cout] in its stored type (F32 / BF16 / Q8_0 / Q4_0) as mul_mat's
+            // first operand; im2col only needs the kernel's shape
+            const int64_t k  = a.at("kernel");
+            ggml_tensor * ws = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, wq->ne[0] / k, 1);
+            ggml_tensor * col = ggml_im2col(ctx, ws, full, st, 0, 0, 0, dl, 0, false, GGML_TYPE_F32);  // [Cin k, Tout, 1]
+            y = ggml_mul_mat(ctx, wq, ggml_reshape_2d(ctx, col, col->ne[0], col->ne[1] * col->ne[2]));  // [Cout, Tout]
+            y = ggml_cont(ctx, ggml_transpose(ctx, y));                                                  // [Tout, Cout]
+            return conv_bias_act(n, y);
+        }
+        ggml_tensor * w = weight(p + ".weight");  // ggml [k, Cin / g, Cout]
         if (gr == 1) {
             ggml_tensor * col = ggml_im2col(ctx, w, full, st, 0, 0, 0, dl, 0, false, GGML_TYPE_F32);   // [Cin k, Tout, 1]
             y = ggml_mul_mat(ctx, ggml_reshape_2d(ctx, col, col->ne[0], col->ne[1] * col->ne[2]),
@@ -702,12 +712,16 @@ struct Builder {
         xt               = ggml_reshape_2d(ctx, xt, xt->ne[0], ggml_nelements(xt) / xt->ne[0]);
         const int     c = a.at("ctx"), st = a.at("stride"), trim = a.at("trim");
         ggml_tensor * full = with_ctx(a, xt, c);
-        ggml_tensor * w    = weight(p + ".weight");  // ggml [k, Cout, Cin]
-        const int64_t k = w->ne[0], Co = w->ne[1], Lf = full->ne[0];
+        ggml_tensor * w    = m.get(p + ".weight");  // ggml [k, Cout, Cin]; a weights file has only .weight.ct
+        ggml_tensor * wct  = m.get(p + ".weight.ct");  // [Cin, k Cout]
+        if (!w && !wct) {
+            throw std::runtime_error("missing tensor " + p + ".weight");
+        }
+        const int64_t k = w ? w->ne[0] : a.at("kernel").get<int64_t>(), Co = w ? w->ne[1] : wct->ne[1] / k, Lf = full->ne[0];
         ggml_tensor * y;
-        if (k % st == 0) {
+        if (k % st == 0 && wct) {
             // cols [k Cout, L] = W^T x, then y[o, (l + q) s + r] += cols[q s + r + k o, l] for q < k / s (overlap-add)
-            ggml_tensor * cols = ggml_mul_mat(ctx, weight(p + ".weight.ct"), ggml_cont(ctx, ggml_transpose(ctx, full)));
+            ggml_tensor * cols = ggml_mul_mat(ctx, wct, ggml_cont(ctx, ggml_transpose(ctx, full)));
             const int     mq   = (int) (k / st);
             y                  = nullptr;
             for (int q = 0; q < mq; ++q) {
@@ -718,6 +732,9 @@ struct Builder {
                 y  = y ? ggml_add(ctx, y, pc) : pc;
             }
         } else {
+            if (!w) {
+                throw std::runtime_error(p + ": kernel not a multiple of the stride needs .weight");
+            }
             y = ggml_conv_transpose_1d(ctx, w, full, st, 0, 1);  // [L, Cout]
         }
         const int64_t L    = y->ne[0] - (int64_t) c * st - trim;

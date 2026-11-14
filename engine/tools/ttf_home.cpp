@@ -52,7 +52,7 @@ namespace {
 
 struct Args {
     std::string                        model, text, list, out = "out.wav", device, dump, graph, out_dir = ".";
-    std::string                        noise, feat;
+    std::string                        noise, feat, vae, split_out, vae_types = "f32,bf16,q8_0,q4_0";
     std::vector<int32_t>               ids;
     std::map<std::string, std::string> gin;
     int                                n_gen = 128, threads = 4, top_k = 40, check_dec = 0, pp = 512, tg = 128, reps = 3,
@@ -305,6 +305,132 @@ void print_ops(const ttf::Session & s, int n) {
 }
 
 // ---- one graph on raw inputs (checks)
+// --split-vae OUT: a speech model's file without its audio VAE (OUT.ttf) and the VAE decoder as separate weights files
+// (OUT-vae-<type>.ttf; --vae-types f32,bf16,q8_0,q4_0). In a weights file the decoder's large convolutions are stored in
+// the layout the runtime multiplies with: a transposed conv as .weight.ct [Cin, k Cout], a dense conv as .weight.q
+// [k Cin, Cout] (f32 keeps .weight as is), in the file's type; the rest as stored. The encoder (for voice cloning, not
+// in the runtime yet) is in neither file.
+int run_split_vae(const ttf::Model & m, const Args & a) {
+    auto starts = [](const std::string & s, const char * p) { return s.compare(0, std::strlen(p), p) == 0; };
+    // the model file: every kv, every tensor but the VAE's
+    {
+        gguf_context * o = gguf_init_empty();
+        gguf_set_kv(o, m.gguf);
+        size_t n = 0, bytes = 0;
+        for (ggml_tensor * t = ggml_get_first_tensor(m.meta); t; t = ggml_get_next_tensor(m.meta, t)) {
+            if (!starts(ggml_get_name(t), "audio_vae.")) {
+                gguf_add_tensor(o, t);
+                ++n;
+                bytes += ggml_nbytes(t);
+            }
+        }
+        const std::string out = a.split_out + ".ttf";
+        if (!gguf_write_to_file(o, out.c_str(), false)) {
+            std::fprintf(stderr, "cannot write %s\n", out.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "%s: %zu tensors, %.1f MiB\n", out.c_str(), n, bytes / 1048576.0);
+        gguf_free(o);
+    }
+    // conv kinds of the decoder's weights
+    std::map<std::string, std::string> kind;  // p -> "ct" | "dense"
+    for (const auto & n : m.ir.at("graphs").at("vae_decode").at("nodes")) {
+        const std::string op = n.at("op");
+        if (op == "conv_transpose1d_causal") {
+            kind[n.at("p")] = "ct";
+        } else if (op == "conv1d_causal" && n.at("attr").value("groups", 1) == 1) {
+            kind[n.at("p")] = "dense";
+        }
+    }
+    std::stringstream ts(a.vae_types);
+    for (std::string ty; std::getline(ts, ty, ',');) {
+        const ggml_type T = ty == "f32" ? GGML_TYPE_F32 : ty == "bf16" ? GGML_TYPE_BF16 : ty == "q8_0" ? GGML_TYPE_Q8_0
+                          : ty == "q4_0" ? GGML_TYPE_Q4_0 : ty == "q4_k" ? GGML_TYPE_Q4_K : GGML_TYPE_COUNT;
+        if (T == GGML_TYPE_COUNT) {
+            std::fprintf(stderr, "--vae-types: unknown type %s\n", ty.c_str());
+            return 1;
+        }
+        std::vector<std::pair<const ggml_tensor *, std::string>> src;  // (source, how)
+        size_t need = 0;
+        for (ggml_tensor * t = ggml_get_first_tensor(m.meta); t; t = ggml_get_next_tensor(m.meta, t)) {
+            const std::string nm = ggml_get_name(t);
+            if (!starts(nm, "audio_vae.decoder.")) {
+                continue;
+            }
+            std::string how = "copy";
+            const std::string p = nm.size() > 7 && nm.compare(nm.size() - 7, 7, ".weight") == 0 ? nm.substr(0, nm.size() - 7) : "";
+            const int64_t blk = ggml_blck_size(T);
+            if (!p.empty() && kind.count(p) && t->type == GGML_TYPE_F32) {
+                const int64_t row = kind[p] == "ct" ? t->ne[2] : t->ne[0] * t->ne[1];
+                if (kind[p] == "ct") {
+                    how = row % blk == 0 ? "ct" : "ct32";
+                } else if (T != GGML_TYPE_F32 && ggml_nelements(t) >= 65536 && row % blk == 0) {
+                    how = "dense";
+                }
+            }
+            src.emplace_back(t, how);
+            need += ggml_tensor_overhead() + ggml_nbytes(t) + 64;
+        }
+        ggml_init_params ip = { need + (1 << 20), nullptr, false };
+        ggml_context *   c  = ggml_init(ip);
+        gguf_context *   o  = gguf_init_empty();
+        gguf_set_val_str(o, "general.architecture", "ttf");
+        gguf_set_val_u32(o, "ttf.format_version", 1);
+        gguf_set_val_str(o, "ttf.weights_for", m.family.c_str());
+        gguf_set_val_str(o, "ttf.weights_type", ty.c_str());
+        size_t bytes = 0;
+        for (auto & [t, how] : src) {
+            const std::string nm = ggml_get_name(t);
+            ggml_tensor *     d;
+            if (how == "copy") {
+                d = ggml_dup_tensor(c, t);
+                std::memcpy(d->data, t->data, ggml_nbytes(t));
+                ggml_set_name(d, nm.c_str());
+            } else {
+                const float * f = (const float *) t->data;
+                std::vector<float> tr;
+                int64_t rows, row;
+                if (how == "ct" || how == "ct32") {  // ggml [k, Cout, Cin] -> [Cin, k Cout]
+                    const int64_t kc = t->ne[0] * t->ne[1], ci = t->ne[2];
+                    tr.resize(kc * ci);
+                    for (int64_t i = 0; i < ci; ++i) {
+                        for (int64_t j = 0; j < kc; ++j) {
+                            tr[i + ci * j] = f[j + kc * i];
+                        }
+                    }
+                    f    = tr.data();
+                    row  = ci;
+                    rows = kc;
+                } else {  // dense [k, Cin, Cout] = [k Cin, Cout] in memory
+                    row  = t->ne[0] * t->ne[1];
+                    rows = t->ne[2];
+                }
+                const ggml_type tt = how == "ct32" ? GGML_TYPE_F32 : T;
+                d = ggml_new_tensor_2d(c, tt, row, rows);
+                ggml_set_name(d, (nm.substr(0, nm.size() - 7) + (how == "dense" ? ".weight.q" : ".weight.ct")).c_str());
+                if (tt == GGML_TYPE_F32) {
+                    std::memcpy(d->data, f, row * rows * sizeof(float));
+                } else if (tt == GGML_TYPE_BF16) {
+                    ggml_fp32_to_bf16_row(f, (ggml_bf16_t *) d->data, row * rows);
+                } else {
+                    ggml_quantize_chunk(tt, f, d->data, 0, rows, row, nullptr);
+                }
+            }
+            gguf_add_tensor(o, d);
+            bytes += ggml_nbytes(d);
+        }
+        const std::string out = a.split_out + "-vae-" + ty + ".ttf";
+        if (!gguf_write_to_file(o, out.c_str(), false)) {
+            std::fprintf(stderr, "cannot write %s\n", out.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "%s: %zu tensors, %.1f MiB\n", out.c_str(), src.size(), bytes / 1048576.0);
+        gguf_free(o);
+        ggml_free(c);
+    }
+    return 0;
+}
+
 int run_graph(const ttf::Model & m, const Args & a) {
     ttf::Values in;
     for (const auto & spec : m.ir.at("graphs").at(a.graph).at("inputs")) {
@@ -1347,7 +1473,7 @@ const char * USAGE =
     "       ttf-home MODEL --list FILE           speech model, one job per line: out.wav<TAB>text[<TAB>seed]\n"
     "       ttf-home MODEL --tokenize [--specials] [--escapes] < lines\n"
     "options: -n N  --temp T  --top-k K  --seed S  -o FILE  --timesteps N  --cfg F  --max-len N  --retry-badcase N\n"
-    "         --ids 1,2,3  --device cpu|cuda  --threads N  --ctx N  -v\n"
+    "         --ids 1,2,3  --device cpu|cuda  --threads N  --ctx N  -v  --vae FILE (a speech model's separate VAE file)\n"
     "checks:  --dump FILE  --check-decode N  --graph NAME --in NAME=FILE [--out DIR]  --noise FILE  --feat FILE\n";
 
 }  // namespace
@@ -1455,6 +1581,12 @@ int main(int argc, char ** argv) {
             a.noise = next();
         } else if (o == "--feat") {
             a.feat = next();
+        } else if (o == "--vae") {
+            a.vae = next();
+        } else if (o == "--split-vae") {
+            a.split_out = next();
+        } else if (o == "--vae-types") {
+            a.vae_types = next();
         } else if (o == "-v") {
             a.verbose = true;
         } else if (!o.empty() && o[0] == '-') {
@@ -1475,12 +1607,12 @@ int main(int argc, char ** argv) {
         if (a.tokenize) {
             return run_tokenize(a.model, a.specials, a.escapes);
         }
-        if (a.graph.empty() && !a.bench && !a.chat && !a.serve && a.text.empty() && a.ids.empty() && a.list.empty()) {
+        if (a.graph.empty() && !a.bench && !a.chat && !a.serve && a.text.empty() && a.ids.empty() && a.list.empty() && a.split_out.empty()) {
             std::fputs(USAGE, stderr);
             return 1;
         }
         std::string err;
-        auto        m = ttf::Model::load(a.model, &err, a.device);
+        auto        m = ttf::Model::load(a.model, &err, a.split_out.empty() ? a.device : "cpu", a.vae);
         if (!m) {
             std::fprintf(stderr, "load: %s\n", err.c_str());
             return 1;
@@ -1489,6 +1621,12 @@ int main(int argc, char ** argv) {
             std::fprintf(stderr, "%s: family %s, driver %s, D %s, %s, trits %s\n", a.model.c_str(), m->family.c_str(),
                          m->ir.at("driver").at("name").get<std::string>().c_str(), m->d_bf16 ? "bf16" : "f32",
                          m->device.c_str(), m->q2p ? "q2p" : "tq1p");
+        }
+        if (a.verbose && !m->vae_path.empty()) {
+            std::fprintf(stderr, "weights file: %s\n", m->vae_path.c_str());
+        }
+        if (!a.split_out.empty()) {
+            return run_split_vae(*m, a);
         }
         if (!a.graph.empty()) {
             return run_graph(*m, a);

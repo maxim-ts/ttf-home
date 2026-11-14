@@ -40,12 +40,19 @@ struct Part {
 struct Model {
     ~Model();
     // device: "cpu" or "cuda" (CUDA0; built with TTF_CUDA). Weights live in that device's buffer.
-    static std::unique_ptr<Model> load(const std::string & path, std::string * err, const std::string & device = "cpu");
+    // vae: a separate weights file (a speech model's VAE, e.g. MODEL-vae-q8_0.ttf); "" = next to the model when the
+    // model's own file lacks those tensors (MODEL-vae.ttf, then -vae-f32 / -bf16 / -q8_0 / -q4_0)
+    static std::unique_ptr<Model> load(const std::string & path, std::string * err, const std::string & device = "cpu",
+                                       const std::string & vae = "");
 
     std::string kv_str(const std::string & key, const std::string & dflt = "") const;
 
     gguf_context * gguf = nullptr;
     ggml_context * meta = nullptr;  // the file's tensors, as stored
+    gguf_context * vgguf = nullptr;  // the separate weights file (VAE), when there is one
+    ggml_context * vmeta = nullptr;  // its tensors (read into memory)
+    std::string    vae_path;
+    std::vector<std::string> dropped_graphs;  // graphs whose weights are in neither file (e.g. vae_encode)
     ggml_context * wctx = nullptr;  // derived tensors: TQ1_P trits, D copies
     json           ir, config;
     bool           d_bf16 = false;  // compute dtype D
