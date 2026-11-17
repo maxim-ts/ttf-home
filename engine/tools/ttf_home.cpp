@@ -302,7 +302,8 @@ void print_ops(const ttf::Session & s, int n) {
         tot += v.first;
     }
     std::sort(ops.rbegin(), ops.rend());
-    for (size_t i = 0; i < ops.size() && i < 25; ++i) {
+    const size_t top = std::getenv("TTF_PROF_TOP") ? (size_t) std::atoi(std::getenv("TTF_PROF_TOP")) : 25;
+    for (size_t i = 0; i < ops.size() && i < top; ++i) {
         std::fprintf(stderr, "  %7.3f ms/call %5.1f%%  %5.0f nodes/call  %s\n", ops[i].first / n, 100 * ops[i].first / tot,
                      (double) s.prof_ops.at(ops[i].second).second / n, ops[i].second.c_str());
     }

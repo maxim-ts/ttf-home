@@ -18,6 +18,10 @@
 #include <stdexcept>
 #include <unordered_map>
 
+// ggml-cpu/ttf-vae.cpp: CPU custom ops for audio VAEs
+extern "C" void ttf_cpu_snake(ggml_tensor * dst, int ith, int nth, void * ud);
+extern "C" void ttf_cpu_dwconv(ggml_tensor * dst, int ith, int nth, void * ud);
+
 namespace ttf {
 
 namespace {
@@ -691,6 +695,11 @@ struct Builder {
             ggml_tensor * col = ggml_im2col(ctx, w, full, st, 0, 0, 0, dl, 0, false, GGML_TYPE_F32);   // [Cin k, Tout, 1]
             y = ggml_mul_mat(ctx, ggml_reshape_2d(ctx, col, col->ne[0], col->ne[1] * col->ne[2]),
                              ggml_reshape_2d(ctx, w, w->ne[0] * w->ne[1], w->ne[2]));                    // [Tout, Cout]
+        } else if (gr == C && w->ne[1] == 1 && st == 1 && m.device == "cpu" && vae_kernels("conv")) {  // depthwise, direct (ttf-vae.cpp)
+            ggml_tensor * fc   = cont(full);
+            ggml_tensor * args[2] = { fc, w };
+            const int64_t To      = fc->ne[0] - (w->ne[0] - 1) * dl;
+            y = ggml_custom_4d(ctx, GGML_TYPE_F32, To, C, 1, 1, args, 2, ttf_cpu_dwconv, GGML_N_TASKS_MAX, (void *) (intptr_t) dl);
         } else if (gr == C && w->ne[1] == 1) {  // depthwise
             ggml_tensor * fb  = ggml_reshape_4d(ctx, full, full->ne[0], 1, C, 1);
             ggml_tensor * col = ggml_im2col(ctx, w, fb, st, 0, 0, 0, dl, 0, false, GGML_TYPE_F32);       // [k, Tout, C]
@@ -757,6 +766,12 @@ struct Builder {
         return ggml_concat(ctx, ggml_sin(ctx, e), ggml_cos(ctx, e), 0);
     }
 
+    // TTF_NO_VAEK=1: the graph forms (im2col + matmul, sin / sqr / mul / add) for A/B; =snake / =conv: only that one
+    static bool vae_kernels(const char * which) {
+        const char * e = std::getenv("TTF_NO_VAEK");
+        return !e || (std::strcmp(e, "1") != 0 && std::strcmp(e, which) != 0);
+    }
+
     ggml_tensor * op_snake(const json & n) {  // x [C, T] torch: x + inv sin^2(alpha x)
         const std::string p  = n.at("p");
         ggml_tensor *     x  = cont(in(n, 0));
@@ -765,6 +780,11 @@ struct Builder {
         const int64_t     C  = ggml_nelements(al);
         al = ggml_reshape_2d(ctx, al, 1, C);
         iv = ggml_reshape_2d(ctx, iv, 1, C);
+        if (m.device == "cpu" && vae_kernels("snake") && x->type == GGML_TYPE_F32) {  // one pass (ttf-vae.cpp)
+            ggml_tensor * args[3] = { x, weight(p + ".alpha"), weight(p + ".alpha.inv") };
+            return ggml_custom_4d(ctx, GGML_TYPE_F32, x->ne[0], x->ne[1], x->ne[2], x->ne[3], args, 3, ttf_cpu_snake, GGML_N_TASKS_MAX,
+                                  nullptr);
+        }
         ggml_tensor * sn = ggml_sin(ctx, ggml_mul(ctx, x, al));
         return ggml_add(ctx, x, ggml_mul(ctx, ggml_sqr(ctx, sn), iv));
     }

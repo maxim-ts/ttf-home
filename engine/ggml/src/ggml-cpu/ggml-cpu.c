@@ -1276,6 +1276,8 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     }
 }
 
+bool ggml_ttf_w8a8_mul_mat(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+
 void ggml_compute_forward_mul_mat(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -1286,6 +1288,11 @@ void ggml_compute_forward_mul_mat(
     const int32_t hint = ggml_get_op_params_i32(dst, 1);
     if (hint == GGML_HINT_SRC0_IS_HADAMARD && !params->use_ref) {
         ggml_compute_forward_fwht(params, dst);
+        return;
+    }
+
+    // ttf-home: W8A8 small-batch path for Q8_0 weights (ttf-w8a8.cpp; TTF_W8A8=1)
+    if (ggml_ttf_w8a8_mul_mat(params, dst)) {
         return;
     }
 
