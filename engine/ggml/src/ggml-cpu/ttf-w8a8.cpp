@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -41,6 +42,8 @@ namespace {
 
 struct W8 {
     int64_t              K = 0, N = 0;
+    bool                 fresh     = true;   // rows not converted yet: the first call converts them, each thread its own
+    bool                 conv_call = false;  // the converting call has run (thread 0's flag)
     std::vector<int8_t>  q;   // [N, K]
     std::vector<float>   s;   // [N]
     std::vector<int32_t> rs;  // [N] row sums (VNNI: the u8 offset's correction)
@@ -49,17 +52,22 @@ struct W8 {
 std::mutex                                   g_mu;
 std::unordered_map<const void *, W8 *>       g_cache;  // by the weight's data pointer (weights do not move)
 
-W8 * convert(const ggml_tensor * w) {
-    const int64_t K = w->ne[0], N = w->ne[1], KB = K / 32;
-    W8 *          c = new W8;
-    c->K = K;
-    c->N = N;
-    c->q.resize((size_t) N * K);
-    c->s.resize(N);
-    c->rs.resize(N);
+W8 * alloc(const ggml_tensor * w) {
+    W8 * c = new W8;
+    c->K   = w->ne[0];
+    c->N   = w->ne[1];
+    c->q.resize((size_t) c->N * c->K);
+    c->s.resize(c->N);
+    c->rs.resize(c->N);
+    return c;
+}
+
+// rows [n0, n1) of the Q8_0 weight into c (each thread converts the rows it multiplies, on the first call)
+void convert_rows(const ggml_tensor * w, W8 * c, int64_t n0, int64_t n1) {
+    const int64_t      K = w->ne[0], KB = K / 32;
     std::vector<float> f(K);
-    for (int64_t n = 0; n < N; ++n) {
-        const block_q8_0 * b = (const block_q8_0 *) ((const char *) w->data + n * w->nb[1]);
+    for (int64_t n = n0; n < n1; ++n) {
+        const block_q8_0 * b    = (const block_q8_0 *) ((const char *) w->data + n * w->nb[1]);
         float              amax = 0;
         for (int64_t j = 0; j < KB; ++j) {
             const float d = GGML_FP16_TO_FP32(b[j].d);
@@ -71,14 +79,13 @@ W8 * convert(const ggml_tensor * w) {
         const float s = amax / 127.f, is = s > 0 ? 1.f / s : 0.f;
         int32_t     sum = 0;
         for (int64_t k = 0; k < K; ++k) {
-            const int q = (int) std::lrintf(f[k] * is);
+            const int q              = (int) std::lrintf(f[k] * is);
             c->q[(size_t) n * K + k] = (int8_t) q;
             sum += q;
         }
         c->s[n]  = s;
         c->rs[n] = sum;
     }
-    return c;
 }
 
 inline int hsum8i(__m256i v) {
@@ -191,12 +198,25 @@ void gemm(const W8 * w, int64_t K, int64_t n0, int64_t n1, const uint8_t * aq, c
 
 }  // namespace
 
+// on / off: TTF_W8A8=0|1 when set, else what the runtime chose (ggml_ttf_w8a8_enable; speech models turn it on: the
+// VoxCPM2 DiT A/B showed no measurable loss, 17 Nov 2026), else off
+namespace {
+std::atomic<int> g_on{ [] {
+    const char * e = std::getenv("TTF_W8A8");
+    return e ? std::atoi(e) : 0;
+}() };
+}  // namespace
+
+extern "C" void ggml_ttf_w8a8_enable(int on);
+extern "C" void ggml_ttf_w8a8_enable(int on) {
+    if (!std::getenv("TTF_W8A8")) {
+        g_on.store(on, std::memory_order_relaxed);
+    }
+}
+
 extern "C" bool ggml_ttf_w8a8_mul_mat(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 extern "C" bool ggml_ttf_w8a8_mul_mat(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
-    static const int on = [] {
-        const char * e = std::getenv("TTF_W8A8");
-        return e ? std::atoi(e) : 0;
-    }();
+    const int on = g_on.load(std::memory_order_relaxed);
     const ggml_tensor * w = dst->src[0];
     const ggml_tensor * x = dst->src[1];
     if (!on || params->use_ref || w->type != GGML_TYPE_Q8_0 || x->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
@@ -212,7 +232,8 @@ extern "C" bool ggml_ttf_w8a8_mul_mat(const struct ggml_compute_params * params,
         return false;
     }
     const int ith = params->ith, nth = params->nth;
-    // the weight in W8, converted once (thread 0; the others wait at the barrier)
+    // the weight in W8: allocated by thread 0; on the first call every thread converts the rows it multiplies (the
+    // splits of all threads cover [0, N), so the next call, after at least one barrier, finds every row converted)
     W8 * c = nullptr;
     if (ith == 0) {
         std::lock_guard<std::mutex> lk(g_mu);
@@ -222,7 +243,9 @@ extern "C" bool ggml_ttf_w8a8_mul_mat(const struct ggml_compute_params * params,
                 delete it->second;
                 g_cache.erase(it);
             }
-            g_cache.emplace(w->data, convert(w));
+            g_cache.emplace(w->data, alloc(w));
+        } else if (it->second->fresh && it->second->conv_call) {
+            it->second->fresh = false;  // converted in an earlier call
         }
     }
     uint8_t * aq = (uint8_t *) params->wdata;
@@ -237,8 +260,14 @@ extern "C" bool ggml_ttf_w8a8_mul_mat(const struct ggml_compute_params * params,
     }
     const int64_t per = ((N + nth - 1) / nth + 2) / 3 * 3;
     const int64_t n0 = std::min<int64_t>(N, ith * per), n1 = std::min<int64_t>(N, n0 + per);
+    if (c->fresh && n0 < n1) {
+        convert_rows(w, c, n0, n1);
+    }
     if (n0 < n1) {
         gemm(c, K, n0, n1, aq, sa, M, (float *) dst->data, (size_t) N);
+    }
+    if (ith == 0) {
+        c->conv_call = true;  // read by thread 0 only, at its next call
     }
     return true;
 }
@@ -248,5 +277,7 @@ extern "C" bool ggml_ttf_w8a8_mul_mat(const struct ggml_compute_params * params,
 extern "C" bool ggml_ttf_w8a8_mul_mat(const struct ggml_compute_params *, struct ggml_tensor *) {
     return false;
 }
+
+extern "C" void ggml_ttf_w8a8_enable(int) {}
 
 #endif

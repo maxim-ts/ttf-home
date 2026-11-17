@@ -17,6 +17,8 @@
 #include <random>
 #include <stdexcept>
 
+extern "C" void ggml_ttf_w8a8_enable(int on);  // ggml-cpu/ttf-w8a8.cpp
+
 namespace ttf {
 
 namespace {
@@ -302,6 +304,7 @@ SpeakOut speak_once(Session & s, const std::vector<int32_t> & text_ids, const Sp
 // VoxCPM2.generate's retry_badcase: an attempt whose patches reach text tokens * ratio is a runaway; the next attempt
 // uses seed + 1 (up to retry_badcase attempts; the last one is kept)
 SpeakOut speak(Session & s, const std::vector<int32_t> & text_ids, const SpeakParams & p) {
+    ggml_ttf_w8a8_enable(1);  // CPU: W8A8 for the DiT's Q8_0 matmuls (TTF_W8A8=0 keeps ggml's Q8_0)
     SpeakParams        q = p;
     std::vector<float> ref;
     double             ms_ref = 0;
