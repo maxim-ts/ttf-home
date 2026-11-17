@@ -430,8 +430,8 @@ std::unique_ptr<Model> Model::load(const std::string & path, std::string * err, 
                 }
                 done[name]            = true;
                 const ggml_tensor * w = m->get(src);
-                if (kind == ".weight.F32" && w->type == GGML_TYPE_F32) {
-                    continue;
+                if (kind == ".weight.F32" && (w->type == GGML_TYPE_F32 || ggml_is_quantized(w->type))) {
+                    continue;  // matmul reads an F32 or a quantized (e.g. Q8_0) weight as stored
                 }
                 ggml_tensor * d;
                 if (kind == ".weight.conv") {  // depthwise: torch [C, 1, k] = ggml [k, 1, C] -> [k, C]

@@ -32,6 +32,7 @@
 #include <iostream>
 #include <map>
 #include <random>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -53,6 +54,7 @@ namespace {
 struct Args {
     std::string                        model, text, list, out = "out.wav", device, dump, graph, out_dir = ".";
     std::string                        noise, feat, vae, split_out, vae_types = "f32,bf16,q8_0,q4_0";
+    std::string                        matmul_type, matmul_prefix;  // --split-vae: the model file's float matmul weights in this type
     std::vector<int32_t>               ids;
     std::map<std::string, std::string> gin;
     int                                n_gen = 128, threads = 4, top_k = 40, check_dec = 0, pp = 512, tg = 128, reps = 3,
@@ -310,19 +312,89 @@ void print_ops(const ttf::Session & s, int n) {
 // the layout the runtime multiplies with: a transposed conv as .weight.ct [Cin, k Cout], a dense conv as .weight.q
 // [k Cin, Cout] (f32 keeps .weight as is), in the file's type; the rest as stored. The encoder (for voice cloning, not
 // in the runtime yet) is in neither file.
+// --matmul-type q8_0 [--matmul-prefix P1,P2]: in the model file, the float weights read only by matmul nodes (names
+// starting with one of the prefixes; all when none) are stored in that type (rows a multiple of its block; others as
+// stored). The runtime multiplies with them as stored.
 int run_split_vae(const ttf::Model & m, const Args & a) {
     auto starts = [](const std::string & s, const char * p) { return s.compare(0, std::strlen(p), p) == 0; };
     // the model file: every kv, every tensor but the VAE's
     {
+        ggml_type MT = GGML_TYPE_COUNT;
+        if (!a.matmul_type.empty()) {
+            MT = a.matmul_type == "q8_0" ? GGML_TYPE_Q8_0 : a.matmul_type == "q4_0" ? GGML_TYPE_Q4_0
+               : a.matmul_type == "q4_k" ? GGML_TYPE_Q4_K : GGML_TYPE_COUNT;
+            if (MT == GGML_TYPE_COUNT) {
+                std::fprintf(stderr, "--matmul-type: unknown type %s (q8_0, q4_0, q4_k)\n", a.matmul_type.c_str());
+                return 1;
+            }
+        }
+        std::set<std::string> mm, other;  // weights read by matmul nodes / by any other node
+        for (const auto & [gname, g] : m.ir.at("graphs").items()) {
+            for (const auto & n : g.at("nodes")) {
+                if (!n.contains("p") || !n.at("p").is_string()) {
+                    continue;
+                }
+                (n.at("op") == "matmul" ? mm : other).insert(n.at("p").get<std::string>() + ".weight");
+            }
+        }
+        std::vector<std::string> pre;
+        {
+            std::stringstream ps(a.matmul_prefix);
+            for (std::string x; std::getline(ps, x, ',');) {
+                if (!x.empty()) {
+                    pre.push_back(x);
+                }
+            }
+        }
+        ggml_context * qc = nullptr;
+        if (MT != GGML_TYPE_COUNT) {
+            ggml_init_params ip = { 0, nullptr, false };
+            for (ggml_tensor * t = ggml_get_first_tensor(m.meta); t; t = ggml_get_next_tensor(m.meta, t)) {
+                ip.mem_size += ggml_tensor_overhead() + ggml_nbytes(t) + 64;
+            }
+            qc = ggml_init(ip);
+        }
         gguf_context * o = gguf_init_empty();
         gguf_set_kv(o, m.gguf);
-        size_t n = 0, bytes = 0;
+        size_t n = 0, bytes = 0, nq = 0;
         for (ggml_tensor * t = ggml_get_first_tensor(m.meta); t; t = ggml_get_next_tensor(m.meta, t)) {
-            if (!starts(ggml_get_name(t), "audio_vae.")) {
+            const std::string nm = ggml_get_name(t);
+            if (starts(nm, "audio_vae.")) {
+                continue;
+            }
+            bool q = qc && mm.count(nm) && !other.count(nm) && ggml_n_dims(t) == 2 &&
+                     (t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_BF16 || t->type == GGML_TYPE_F16) &&
+                     t->ne[0] % ggml_blck_size(MT) == 0;
+            if (q && !pre.empty()) {
+                q = false;
+                for (auto & x : pre) {
+                    q = q || starts(nm, x.c_str());
+                }
+            }
+            if (q) {
+                const int64_t      K = t->ne[0], N = t->ne[1];
+                std::vector<float> f(K * N);
+                if (t->type == GGML_TYPE_F32) {
+                    std::memcpy(f.data(), t->data, f.size() * 4);
+                } else if (t->type == GGML_TYPE_BF16) {
+                    ggml_bf16_to_fp32_row((const ggml_bf16_t *) t->data, f.data(), f.size());
+                } else {
+                    ggml_fp16_to_fp32_row((const ggml_fp16_t *) t->data, f.data(), f.size());
+                }
+                ggml_tensor * d = ggml_new_tensor_2d(qc, MT, K, N);
+                ggml_set_name(d, nm.c_str());
+                ggml_quantize_chunk(MT, f.data(), d->data, 0, N, K, nullptr);
+                gguf_add_tensor(o, d);
+                bytes += ggml_nbytes(d);
+                ++nq;
+            } else {
                 gguf_add_tensor(o, t);
-                ++n;
                 bytes += ggml_nbytes(t);
             }
+            ++n;
+        }
+        if (qc) {
+            std::fprintf(stderr, "--matmul-type %s: %zu matmul weights\n", a.matmul_type.c_str(), nq);
         }
         const std::string out = a.split_out + ".ttf";
         if (!gguf_write_to_file(o, out.c_str(), false)) {
@@ -331,6 +403,9 @@ int run_split_vae(const ttf::Model & m, const Args & a) {
         }
         std::fprintf(stderr, "%s: %zu tensors, %.1f MiB\n", out.c_str(), n, bytes / 1048576.0);
         gguf_free(o);
+        if (qc) {
+            ggml_free(qc);
+        }
     }
     // conv kinds of the decoder's weights
     std::map<std::string, std::string> kind;  // p -> "ct" | "dense"
@@ -1474,7 +1549,8 @@ const char * USAGE =
     "       ttf-home MODEL --tokenize [--specials] [--escapes] < lines\n"
     "options: -n N  --temp T  --top-k K  --seed S  -o FILE  --timesteps N  --cfg F  --max-len N  --retry-badcase N\n"
     "         --ids 1,2,3  --device cpu|cuda  --threads N  --ctx N  -v  --vae FILE (a speech model's separate VAE file)\n"
-    "checks:  --dump FILE  --check-decode N  --graph NAME --in NAME=FILE [--out DIR]  --noise FILE  --feat FILE\n";
+    "checks:  --dump FILE  --check-decode N  --graph NAME --in NAME=FILE [--out DIR]  --noise FILE  --feat FILE\n"
+    "files:   --split-vae OUT [--vae-types f32,bf16,q8_0,q4_0,q4_k] [--matmul-type q8_0 [--matmul-prefix P1,P2]]\n";
 
 }  // namespace
 
@@ -1587,6 +1663,10 @@ int main(int argc, char ** argv) {
             a.split_out = next();
         } else if (o == "--vae-types") {
             a.vae_types = next();
+        } else if (o == "--matmul-type") {
+            a.matmul_type = next();
+        } else if (o == "--matmul-prefix") {
+            a.matmul_prefix = next();
         } else if (o == "-v") {
             a.verbose = true;
         } else if (!o.empty() && o[0] == '-') {

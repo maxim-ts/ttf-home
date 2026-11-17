@@ -45,6 +45,9 @@ $E model.ttf --bench                              # prefill / decode speed, byte
 $E speech.ttf "Hello from a ternary model." -o hi.wav          # a speech model speaks the text
 $E speech.ttf --list jobs.tsv                     # many: one out.wav<TAB>text[<TAB>seed] per line
 $E speech.ttf --vae speech-vae-q8_0.ttf "Hi."     # the audio VAE from its own file (else found next to the model)
+$E speech.ttf --split-vae out/speech --vae-types q8_0,q4_k --matmul-type q8_0 --matmul-prefix feat_decoder.
+                                                  # model file without the VAE (its float matmul weights under the
+                                                  # prefix in Q8_0) + the VAE decoder as separate files
 ```
 
 `--device cpu|cuda` picks the device (CUDA when the build has it), `-v` prints timings, `--help` lists the rest
@@ -60,9 +63,10 @@ a follow-up turn reuses the state of the conversation so far.
 graphs; the program reads the architecture from the file. Supported now: Qwen3.5 / 3.8 dense (gated attention +
 Gated DeltaNet), VoxCPM2 (text-to-speech), BitNet b1.58 / Falcon3-1.58bit (Llama architecture) and the TTF
 models trained from scratch. Get one:
-- [ttf-VoxCPM2](https://huggingface.co/oguzeldereli/ttf-VoxCPM2): ternary VoxCPM2, multilingual text-to-speech: 662 MB
-  plus its audio VAE as a separate file (f32 183 MB, bf16 92 MB, Q8_0 49 MB, Q4_K 27 MB, Q4_0 26 MB; Q8_0 sounds the
-  same as f32), or everything in one 1.04 GB file. A version with more recovery training is coming.
+- [ttf-VoxCPM2](https://huggingface.co/oguzeldereli/ttf-VoxCPM2): VoxCPM2, multilingual text-to-speech, with ternary
+  language models and its diffusion transformer in Q8_0: 827 MB, plus its audio VAE as a separate file (f32 183 MB,
+  bf16 92 MB, Q8_0 49 MB, Q4_K 27 MB, Q4_0 26 MB; Q8_0 sounds the same as f32). Q8_0 matmul weights need this
+  runtime from 17 Nov 2026 on.
 - Export your own with ttf-ternary: `python -m ttf.export.qwen35 HF_DIR CKPT OUT.ttf` (a converted or TTF-trained
   Qwen3.5 checkpoint), `python -m ttf.export.bitnet HF_DIR OUT.ttf` (Microsoft BitNet b1.58,
   tiiuae/Falcon3-*-1.58bit).
@@ -187,7 +191,7 @@ GGUF (llama.cpp, `ttf engine build --q38`):
 
 | model | file | quality | made by |
 |---|---|---|---|
-| [ttf-VoxCPM2](https://huggingface.co/oguzeldereli/ttf-VoxCPM2) | 662 MB + VAE (49 MB in Q8_0), ternary (1.6 bits) + bf16 | English WER 3.22% (full precision 2.56%), speaker similarity 0.951 (0.959), Chinese CER 5.76% (3.24%) | ttf-conversion + 3000 steps of multilingual TTF recovery training |
+| [ttf-VoxCPM2](https://huggingface.co/oguzeldereli/ttf-VoxCPM2) | 827 MB + VAE (49 MB in Q8_0): ternary LMs (1.6 bits) + Q8_0 diffusion transformer | blind listening 3.02 (full precision 2.75); English UTMOS 4.31 (4.25), WER 2.61% (2.70%); FLEURS (27 languages, this runtime) median CER 0.043 | ttf-conversion + 3000 steps of TTF recovery, then 1500 steps of TTF distillation with the original DiT (8-bit, frozen) |
 
 GSM8K is scored on the first 200 problems, IFEval (strict) on the first 200 prompts. Knowledge recall (TriviaQA) is
 where ternary costs the most. The model cards on Hugging Face have the details.
