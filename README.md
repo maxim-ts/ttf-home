@@ -91,7 +91,10 @@ models trained from scratch. Get one:
 - Decode keeps the GPU busy between tokens: the next token's step is queued on the GPU before the host reads the
   current one (greedy: the argmax stays on the device; sampling: only the top k come back). The laptop GPU's power cap
   limits what that gains there.
-- VoxCPM2 on the laptop: 3 s of speech in 1.2 s (real-time factor 0.39).
+- VoxCPM2 on the laptop GPU (RTX 4080 laptop): real-time factor 0.24-0.26 (4 s of speech in about 1 s), with or
+  without `--ref`. On the CPU (i9-14900HX, 7 cores): real-time factor 0.8-1.1 (about real time). The DiT's 8-bit
+  matrices run through an int8 kernel for small batches (AVX-VNNI; AVX2 elsewhere, slower: i7-9800X RTF 2.5), weights
+  with one scale per row and activations with one per token; `TTF_W8A8=0` uses ggml's Q8_0 instead (RTF ~2 there).
 - CPU (i9-14900HX, 8 threads): BitNet b1.58 2B4T 38.5-40 tok/s decode (tuned llama.cpp 41.4).
 
 **Exactness.** Every op has a reference: the `.ttf` exporter runs the file's graphs in PyTorch and the runtime's per-op

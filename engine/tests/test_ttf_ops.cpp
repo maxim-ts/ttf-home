@@ -216,7 +216,9 @@ int test_i4(ggml_backend_t cpu, ggml_backend_t gpu) {
                         o.y.size(), worst, bad ? "  FAIL" : "");
             fails += bad;
         };
-        cmp("cpu", run_i4(cpu, K, V, T, wb, ids, x), true);
+        // products within tolerance on CPU too: with llamafile on (17 Nov 2026) the BF16 reference matmul sums in its own
+        // order for T > 1 (rows stay bit-exact)
+        cmp("cpu", run_i4(cpu, K, V, T, wb, ids, x), false);
         if (gpu) {
             cmp("cuda", run_i4(gpu, K, V, T, wb, ids, x), false);
         }
