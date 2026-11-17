@@ -4,7 +4,7 @@
 //
 //   ttf-home MODEL "text" [-n N] [--temp T] [--top-k K] [--seed S]      text model: the continuation on stdout
 //   ttf-home MODEL "text" [-o out.wav] [--seed S] [--timesteps N] [--cfg F] [--max-len N]   speech model
-//   ttf-home MODEL --list FILE           speech model: one load, then each line "out.wav<TAB>text[<TAB>seed]"
+//   ttf-home MODEL --list FILE           speech model: one load, then each line "out.wav<TAB>text[<TAB>seed[<TAB>ref.wav]]"
 //   ttf-home MODEL --chat [--system S] [--think | --no-think] [--effort xhigh|medium|low]
 //            text model with a chat template: one turn per stdin line, the reply streamed; the KV state is kept
 //            across turns (/reset clears it). Sampling defaults --temp 0.7 --top-k 20; -n: the most reply tokens
@@ -35,6 +35,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <arpa/inet.h>
@@ -57,7 +58,7 @@ struct Args {
     std::string                        matmul_type, matmul_prefix;  // --split-vae: the model file's float matmul weights in this type
     std::vector<int32_t>               ids;
     std::map<std::string, std::string> gin;
-    int                                n_gen = 128, threads = 4, top_k = 40, check_dec = 0, pp = 512, tg = 128, reps = 3,
+    int                                n_gen = 128, threads = 0, top_k = 40, check_dec = 0, pp = 512, tg = 128, reps = 3,
                                        depth = 16;
     int64_t                            ctx = 0;
     float                              temp = 0.0f;
@@ -68,6 +69,7 @@ struct Args {
     bool                               serve = false;
     int                                port  = 8080;
     ttf::SpeakParams                   sp;
+    std::string                        ref;  // --ref WAV: voice cloning
     uint32_t                           seed = 0;
 };
 
@@ -310,8 +312,8 @@ void print_ops(const ttf::Session & s, int n) {
 // --split-vae OUT: a speech model's file without its audio VAE (OUT.ttf) and the VAE decoder as separate weights files
 // (OUT-vae-<type>.ttf; --vae-types f32,bf16,q8_0,q4_0). In a weights file the decoder's large convolutions are stored in
 // the layout the runtime multiplies with: a transposed conv as .weight.ct [Cin, k Cout], a dense conv as .weight.q
-// [k Cin, Cout] (f32 keeps .weight as is), in the file's type; the rest as stored. The encoder (for voice cloning, not
-// in the runtime yet) is in neither file.
+// [k Cin, Cout] (f32 keeps .weight as is), in the file's type; the rest as stored. The VAE encoder (voice cloning,
+// --ref) goes into the VAE files too, the same way.
 // --matmul-type q8_0 [--matmul-prefix P1,P2]: in the model file, the float weights read only by matmul nodes (names
 // starting with one of the prefixes; all when none) are stored in that type (rows a multiple of its block; others as
 // stored). The runtime multiplies with them as stored.
@@ -407,14 +409,19 @@ int run_split_vae(const ttf::Model & m, const Args & a) {
             ggml_free(qc);
         }
     }
-    // conv kinds of the decoder's weights
+    // conv kinds of the decoder's and the encoder's weights
     std::map<std::string, std::string> kind;  // p -> "ct" | "dense"
-    for (const auto & n : m.ir.at("graphs").at("vae_decode").at("nodes")) {
-        const std::string op = n.at("op");
-        if (op == "conv_transpose1d_causal") {
-            kind[n.at("p")] = "ct";
-        } else if (op == "conv1d_causal" && n.at("attr").value("groups", 1) == 1) {
-            kind[n.at("p")] = "dense";
+    for (const char * gn : { "vae_decode", "vae_encode" }) {
+        if (!m.ir.at("graphs").contains(gn)) {
+            continue;
+        }
+        for (const auto & n : m.ir.at("graphs").at(gn).at("nodes")) {
+            const std::string op = n.at("op");
+            if (op == "conv_transpose1d_causal") {
+                kind[n.at("p")] = "ct";
+            } else if (op == "conv1d_causal" && n.at("attr").value("groups", 1) == 1) {
+                kind[n.at("p")] = "dense";
+            }
         }
     }
     std::stringstream ts(a.vae_types);
@@ -429,7 +436,7 @@ int run_split_vae(const ttf::Model & m, const Args & a) {
         size_t need = 0;
         for (ggml_tensor * t = ggml_get_first_tensor(m.meta); t; t = ggml_get_next_tensor(m.meta, t)) {
             const std::string nm = ggml_get_name(t);
-            if (!starts(nm, "audio_vae.decoder.")) {
+            if (!starts(nm, "audio_vae.decoder.") && !(starts(nm, "audio_vae.encoder.") && m.ir.at("graphs").contains("vae_encode"))) {
                 continue;
             }
             std::string how = "copy";
@@ -1417,6 +1424,7 @@ int run_speech(const ttf::Model & m, Args a) {
     struct Job {
         std::string out, text;  // text "" = --ids
         uint32_t    seed;
+        std::string ref = "";   // --list's 4th column: this line's reference voice (else --ref)
     };
     std::vector<Job> jobs;
     if (!a.list.empty()) {
@@ -1433,11 +1441,19 @@ int run_speech(const ttf::Model & m, Args a) {
             std::string  rest = line.substr(tab + 1);
             uint32_t     sd   = a.seed;
             const size_t t2   = rest.find('\t');
+            std::string  rf;
             if (t2 != std::string::npos) {
-                sd   = (uint32_t) std::strtoul(rest.c_str() + t2 + 1, nullptr, 10);
+                const std::string more = rest.substr(t2 + 1);
+                const size_t      t3   = more.find('\t');
+                if (!more.empty() && more[0] != '\t') {
+                    sd = (uint32_t) std::strtoul(more.c_str(), nullptr, 10);
+                }
+                if (t3 != std::string::npos) {
+                    rf = more.substr(t3 + 1);
+                }
                 rest = rest.substr(0, t2);
             }
-            jobs.push_back({ line.substr(0, tab), rest, sd });
+            jobs.push_back({ line.substr(0, tab), rest, sd, rf });
         }
     } else if (a.bench) {
         const char * t = "The quick brown fox jumps over the lazy dog, and then it runs back home before the rain.";
@@ -1455,6 +1471,12 @@ int run_speech(const ttf::Model & m, Args a) {
     }
     ttf::Session s(m, a.threads, a.ctx ? a.ctx : 4096);
     double       bsec = 0, bms = 0;
+    std::vector<float> ref;
+    if (!a.ref.empty()) {
+        ref = ttf::load_audio(a.ref, m.ir.at("driver").at("attr").value("in_sample_rate", 16000));
+        std::fprintf(stderr, "reference voice: %s (%.1f s)\n", a.ref.c_str(), ref.size() / (double) m.ir.at("driver").at("attr").value("in_sample_rate", 16000));
+        a.sp.ref_audio = &ref;
+    }
     for (size_t k = 0; k < jobs.size(); ++k) {
         const Job &          jb  = jobs[k];
         std::vector<int32_t> ids = jb.text.empty() ? a.ids : encode(*txt, jb.text, false);
@@ -1463,6 +1485,13 @@ int run_speech(const ttf::Model & m, Args a) {
             return 1;
         }
         a.sp.seed = jb.seed;
+        std::vector<float> lref;
+        if (!jb.ref.empty()) {
+            lref           = ttf::load_audio(jb.ref, m.ir.at("driver").at("attr").value("in_sample_rate", 16000));
+            a.sp.ref_audio = &lref;
+        } else {
+            a.sp.ref_audio = ref.empty() ? nullptr : &ref;
+        }
         s.prof_build = s.prof_alloc = s.prof_galloc = s.prof_compute = 0;
         const double  t0  = now_ms();
         ttf::SpeakOut o   = ttf::speak(s, ids, a.sp);
@@ -1482,6 +1511,10 @@ int run_speech(const ttf::Model & m, Args a) {
                          o.n_patches, o.ms_prefill, o.ms_dit, o.ms_lm, o.ms_enc, o.ms_vae);
             std::fprintf(stderr, "  session: build %.0f ms, alloc %.0f ms (allocator %.0f), compute %.0f ms\n", s.prof_build,
                          s.prof_alloc, s.prof_galloc, s.prof_compute);
+            if (!s.prof_ops.empty()) {  // TTF_PROF_OPS=1: the ops' time over this utterance
+                print_ops(s, 1);
+                s.prof_ops.clear();
+            }
         }
         if (!write_wav(jb.out, o.wav, o.sample_rate)) {
             std::fprintf(stderr, "cannot write %s\n", jb.out.c_str());
@@ -1545,14 +1578,35 @@ const char * USAGE =
     "       ttf-home MODEL --chat [--system S] [--think | --no-think] [--effort xhigh|medium|low]   text model, stdin turns\n"
     "       ttf-home MODEL --serve [--host 127.0.0.1] [--port 8080]   chat page at /, OpenAI-style /v1/chat/completions\n"
     "       ttf-home MODEL --bench [--pp 512] [--tg 128] [--reps 3] [--depth 16]\n"
-    "       ttf-home MODEL --list FILE           speech model, one job per line: out.wav<TAB>text[<TAB>seed]\n"
+    "       ttf-home MODEL --list FILE           speech model, one job per line: out.wav<TAB>text[<TAB>seed[<TAB>ref.wav]]\n"
     "       ttf-home MODEL --tokenize [--specials] [--escapes] < lines\n"
     "options: -n N  --temp T  --top-k K  --seed S  -o FILE  --timesteps N  --cfg F  --max-len N  --retry-badcase N\n"
-    "         --ids 1,2,3  --device cpu|cuda  --threads N  --ctx N  -v  --vae FILE (a speech model's separate VAE file)\n"
+    "         --ref WAV (speech: clone the voice of a 5-20 s clip; no transcript needed)\n"
+    "         --ids 1,2,3  --device cpu|cuda  --threads N (default: the physical cores)  --ctx N  -v  --vae FILE (a speech model's separate VAE file)\n"
     "checks:  --dump FILE  --check-decode N  --graph NAME --in NAME=FILE [--out DIR]  --noise FILE  --feat FILE\n"
     "files:   --split-vae OUT [--vae-types f32,bf16,q8_0,q4_0,q4_k] [--matmul-type q8_0 [--matmul-prefix P1,P2]]\n";
 
 }  // namespace
+
+// the default thread count: the physical cores (Linux /proc/cpuinfo: distinct physical id / core id pairs), else
+// half the hardware threads. More threads than cores is slower (VoxCPM2 on CPU, 8 cores: RTF 3.0 at 8, 3.7 at 16).
+int default_threads() {
+    std::ifstream          f("/proc/cpuinfo");
+    std::set<std::string>  cores;
+    std::string            line, phys = "0";
+    while (std::getline(f, line)) {
+        if (line.rfind("physical id", 0) == 0) {
+            phys = line.substr(line.find(':') + 1);
+        } else if (line.rfind("core id", 0) == 0) {
+            cores.insert(phys + "/" + line.substr(line.find(':') + 1));
+        }
+    }
+    if (!cores.empty()) {
+        return (int) cores.size();
+    }
+    const unsigned hc = std::thread::hardware_concurrency();
+    return hc >= 4 ? (int) hc / 2 : std::max(1, (int) hc);
+}
 
 int main(int argc, char ** argv) {
     if (argc < 2 || std::string(argv[1]) == "-h" || std::string(argv[1]) == "--help") {
@@ -1613,6 +1667,8 @@ int main(int argc, char ** argv) {
             a.out = a.out_dir = next();
         } else if (o == "--list") {
             a.list = next();
+        } else if (o == "--ref") {  // speech: clone the voice of this WAV clip (5-20 s of clean speech)
+            a.ref = next();
         } else if (o == "--timesteps") {
             a.sp.timesteps = std::atoi(next().c_str());
         } else if (o == "--cfg") {
@@ -1692,6 +1748,9 @@ int main(int argc, char ** argv) {
             return 1;
         }
         std::string err;
+        if (a.threads <= 0) {
+            a.threads = default_threads();
+        }
         auto        m = ttf::Model::load(a.model, &err, a.split_out.empty() ? a.device : "cpu", a.vae);
         if (!m) {
             std::fprintf(stderr, "load: %s\n", err.c_str());

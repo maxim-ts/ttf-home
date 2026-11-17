@@ -315,6 +315,10 @@ struct SpeakParams {
     // VoxCPM API default is on: 3) while an attempt reaches text tokens * badcase_ratio, seed + 1 each (not with noise)
     int      retry_badcase = 3;
     float    badcase_ratio = 6.0f;
+    // voice cloning (VoxCPM2's reference mode): a reference clip, mono at the VAE's input rate (16 kHz; load_audio
+    // resamples). It is encoded once per call and put before the text as [ref_start, its patches, ref_end]; no
+    // transcript needed. Empty = zero-shot (the model's own voice).
+    const std::vector<float> * ref_audio = nullptr;
 };
 
 struct SpeakOut {
@@ -329,5 +333,8 @@ struct SpeakOut {
 
 // text_ids: the tokenizer's output (the driver appends audio_start)
 SpeakOut speak(Session & s, const std::vector<int32_t> & text_ids, const SpeakParams & p = {});
+
+// a WAV file (PCM 8/16/24/32-bit or float 32/64, any channels: averaged to mono) resampled to sr (windowed sinc)
+std::vector<float> load_audio(const std::string & path, int sr);
 
 }  // namespace ttf

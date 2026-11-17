@@ -13,6 +13,7 @@ set(GGML_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 # ggml's own threadpool: fewer cycles per node barrier than OpenMP (decode 340M, 6 threads: 122 vs 99 tok/s)
 set(GGML_OPENMP OFF CACHE BOOL "")
+set(GGML_LLAMAFILE ON CACHE BOOL "")  # tiled CPU GEMMs for quantized weights (Q8_0 DiT: -20% CPU time, 17 Nov 2026)
 # CUDA graphs (ggml defaults them on only inside llama.cpp): one launch per decode step
 set(GGML_CUDA_GRAPHS ON CACHE BOOL "")
 # -march=native on a CPU with AVX-VNNI emits vpdpbusd; binutils < 2.36 cannot assemble it (lab: binutils 2.35).

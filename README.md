@@ -36,6 +36,10 @@ cmake --build engine/build-cuda -j --target ttf-home
 # or, with the Python CLI installed (pip install -e .): ttf engine build
 ```
 
+If the first cmake line stops at `Compiling the CUDA compiler identification source file "CMakeCUDACompilerId.cu"
+failed`, your gcc is newer than your CUDA toolkit supports (e.g. gcc 15+ with CUDA 12): add
+`-DCMAKE_CUDA_HOST_COMPILER=g++-13` (or another gcc your nvcc accepts), or install a newer CUDA toolkit.
+
 ```bash
 E=engine/build-cuda/ttf-home
 $E model.ttf "Once upon a time" -n 128            # a text model continues the text
@@ -43,15 +47,17 @@ $E model.ttf --chat                               # chat in the terminal (--no-t
 $E model.ttf --serve --port 8080                  # chat page at http://127.0.0.1:8080/ , OpenAI-style API at /v1
 $E model.ttf --bench                              # prefill / decode speed, bytes per token
 $E speech.ttf "Hello from a ternary model." -o hi.wav          # a speech model speaks the text
-$E speech.ttf --list jobs.tsv                     # many: one out.wav<TAB>text[<TAB>seed] per line
+$E speech.ttf "Hi, it's me." --ref me.wav -o me.wav  # clone a voice from a 5-20 s WAV clip (no transcript needed)
+$E speech.ttf --list jobs.tsv                     # many: one out.wav<TAB>text[<TAB>seed[<TAB>ref.wav]] per line
 $E speech.ttf --vae speech-vae-q8_0.ttf "Hi."     # the audio VAE from its own file (else found next to the model)
 $E speech.ttf --split-vae out/speech --vae-types q8_0,q4_k --matmul-type q8_0 --matmul-prefix feat_decoder.
                                                   # model file without the VAE (its float matmul weights under the
-                                                  # prefix in Q8_0) + the VAE decoder as separate files
+                                                  # prefix in Q8_0) + the VAE (decoder, and the encoder that --ref
+                                                  # needs) as separate files
 ```
 
 `--device cpu|cuda` picks the device (CUDA when the build has it), `-v` prints timings, `--help` lists the rest
-(`--temp`, `--top-k`, `--seed`, `--ctx`, `--threads`, ...). The same commands through the CLI: `ttf run MODEL.ttf ...`,
+(`--temp`, `--top-k`, `--seed`, `--ctx`, `--threads` (default: the physical cores), ...). The same commands through the CLI: `ttf run MODEL.ttf ...`,
 `ttf chat MODEL.ttf`, `ttf serve MODEL.ttf`, `ttf bench MODEL.ttf`.
 
 The server's page streams the reply, shows the model's reasoning in a fold above the answer, has a thinking switch,
